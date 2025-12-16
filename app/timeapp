@@ -1,0 +1,89 @@
+from flask import Flask, request, jsonify, render_template
+import psycopg2
+import redis
+import os
+from time import perf_counter
+
+app = Flask(__name__)
+
+# Redis connection
+redis_client = redis.Redis(
+    host=os.getenv("REDIS_HOST", "redis"),
+    port=6379,
+    decode_responses=True
+)
+
+# Postgres connection
+def get_db():
+    return psycopg2.connect(
+        host=os.getenv("DB_HOST", "postgres"),
+        database="usersdb",
+        user="postgres",
+        password="postgres"
+    )
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+@app.route("/add_user", methods=["POST"])
+def add_user():
+    user_id = request.form["id"]
+    name = request.form["name"]
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO users (id, name) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING",
+        (user_id, name)
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    redis_client.set(user_id, name)
+
+    return "User added successfully"
+
+@app.route("/get_user/<user_id>")
+def get_user(user_id):
+
+    # ⏱ Start timer
+    start = perf_counter()
+
+    # 1️⃣ Check Redis
+    name = redis_client.get(user_id)
+    if name:
+        end = perf_counter()
+        return jsonify({
+            "id": user_id,
+            "name": name,
+            "source": "redis",
+            "time_ms": round((end - start) * 1000, 3)
+        })
+
+    # 2️⃣ Check Database
+    db_start = perf_counter()
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM users WHERE id=%s", (user_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    db_end = perf_counter()
+
+    if row:
+        redis_client.set(user_id, row[0])
+        return jsonify({
+            "id": user_id,
+            "name": row[0],
+            "source": "database",
+            "time_ms": round((db_end - start) * 1000, 3),
+            "db_time_ms": round((db_end - db_start) * 1000, 3)
+        })
+
+    return jsonify({"error": "User not found"}), 404
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
